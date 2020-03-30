@@ -1,0 +1,122 @@
+import json
+import os
+
+import boto3
+import botocore
+import mock
+import moto
+
+from src.DynamoDbCreateBackupInformationWriter import lambda_handler
+
+orig_make_api_call = botocore.client.BaseClient._make_api_call
+
+
+class TestDynamoDbCreateBackupInformationWriter:
+    test_table_name = 'pcp-dynamodb-bck-inv-table'
+
+    def create_table(self):
+        # Now any call to dynamodb will go to a fake/local dynamodb.
+        # If you want to put to a table, it needs to exist first, so let's create it.
+        dynamo = boto3.resource('dynamodb')
+        table = dynamo.create_table(
+            TableName=self.test_table_name,
+            KeySchema=[
+                {
+                    'AttributeName': 'backup_arn',
+                    'KeyType': 'HASH'  # primary key
+                }
+            ],
+            AttributeDefinitions=[
+                {
+                    'AttributeName': 'backup_arn',
+                    'AttributeType': 'S'
+                },
+
+            ],
+            ProvisionedThroughput={
+                'ReadCapacityUnits': 5,
+                'WriteCapacityUnits': 5
+            }
+        )
+        return table
+
+    def mock_make_api_call_function(self, operation_name, kwarg):
+        print("INTERCEPTED BOTO3: " + operation_name)
+        if operation_name == 'ListBackups':
+            print("MOCKING ListBackups")
+            # This matches:
+            # test_create_delete_DynamoDB-CreateBackup.json and
+            # test_create_delete_DynamoDB-DeleteBackup.json
+            return {"BackupSummaries": [{
+                "BackupArn": "arn:aws:dynamodb:us-east-1:279398609156:table/table31/backup/01553284917596-d3ea7557",
+                "BackupSizeBytes": "12345",
+                "BackupStatus": 'AVAILABLE',  # 'CREATING'|'DELETED'|'AVAILABLE'
+                "BackupType": 'USER',  # 'USER'|'SYSTEM'|'AWS_BACKUP'
+                "BackupName": "manual27"
+            }]}
+        else:
+            return orig_make_api_call(self, operation_name, kwarg)
+
+    # This decorator takes over all calls to boto3 resource or client ('dynamodb')
+    # it is used in this test for create table, puts and scans (gets) and acts like a real table
+    @moto.mock_dynamodb2
+    # This decorator takes over all calls to boto3 resource or client ('sts')
+    # It is used in this test to allow us to use 'assume_role'
+    @moto.mock_sts
+    # This decorator redirects all boto3 api calls and redirects them to the specified function
+    # It is used in this test to allow us to use the boto3.client('dynamodb').list_backups(), since @moto.dynamodb2
+    # does not support the list_backups method.
+    @mock.patch('botocore.client.BaseClient._make_api_call', new=mock_make_api_call_function)
+    def test_new_backup_events_are_saved_to_inventory(self):
+        """
+        The goal of this test is to verify each backup is a single row in the table. Multiple events for the table
+        will simply update the row in the table.
+        A delete event will add the "deleted time" column value to the existing row.
+        :return:
+        """
+
+        # Setup
+        # Create the DynamoDB backup inventory table like in the central account
+        table = self.create_table()
+        os.environ['PCP_DYNAMODB_AUTO_BCK_INVENTORY_TABLE'] = self.test_table_name
+        context = {}
+
+        # Event 1 - Step 1 Execution - create backup
+        with open(
+                os.path.join(os.path.dirname(__file__), 'test_create_delete_DynamoDB-CreateBackup.json')) as json_file:
+            test_event = json.load(json_file)
+            lambda_handler(test_event, context)
+
+        # Event 1 - Step 2 Verification - verify the create event exists
+        scan_result = table.scan()
+        items_in_db = scan_result["Items"]
+        print(f"Items saved to DB: {len(items_in_db)}")
+        assert len(items_in_db) == 1
+        assert items_in_db[0]["backup_type"] == "USER"
+        assert items_in_db[0]["status"] == "AVAILABLE"
+        assert items_in_db[0]["creation_time"] == '2019-03-21T20:23:27Z'
+        assert ("deletion_time" not in items_in_db) or (items_in_db["deletion_time"] == None)
+
+        # Event 2 - Step 1 Execution - Delete backup
+        with open(os.path.join(os.path.dirname(__file__),
+                               '../tests/test_create_delete_DynamoDB-DeleteBackup.json')) as json_file:
+            testEvent = json.load(json_file)
+            lambda_handler(testEvent, context)
+
+        # Event 2 - Step 2 Verification - verify the create event exists
+        scan_result = table.scan()
+        items_in_db = scan_result["Items"]
+        print(f"Items saved to DB: {len(items_in_db)}")
+        assert len(items_in_db) == 1
+        assert items_in_db[0]["backup_type"] == "USER"
+        assert items_in_db[0]["status"] == "DELETED"
+        assert items_in_db[0]["creation_time"] == '2019-03-21T20:23:27Z'
+        assert items_in_db[0]["deletion_time"] == '2019-03-22T20:15:04Z'
+
+# def test_real_no_mock():
+#     context = {}
+#     os.environ['PCP_DYNAMODB_AUTO_BCK_INVENTORY_TABLE'] = 'test'
+#
+#     with open(os.path.join(os.path.dirname(__file__), 'DynamoDB-DeleteBackup.json')) as json_file:
+#         test_event = json.load(json_file)
+#         lambda_handler(test_event, context)
